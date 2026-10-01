@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import json
 import re
+import secrets
 import subprocess
 import sys
 import time
@@ -16,6 +17,8 @@ from brain import END, KEYS_RE, Brain, keychain
 
 CONFIG = Path.home() / ".config" / "pa-call" / "config.json"
 PORT = 8765
+MAX_KEYPRESSES = 6
+MAX_DIGITS = 3
 FINAL = {"completed", "busy", "no-answer", "failed", "canceled"}
 VOICES = {
     "pt-PT": ("Amazon", "Ines-Neural"),
@@ -49,6 +52,10 @@ class Session:
         self.greeted = False
         self.done = asyncio.Event()
         self.ended_by = "call ended"
+        # The tunnel URL is public: only the call we placed, on this secret path, may drive the session.
+        self.token = secrets.token_urlsafe(24)
+        self.call_sid: str | None = None
+        self.keypresses = 0
 
     def say(self, who: str, text: str):
         self.transcript.append({"t": round(time.time(), 1), "who": who, "text": text})
@@ -58,6 +65,10 @@ class Session:
         await self.ws.send(json.dumps(msg))
 
     async def handle(self, ws):
+        if self.ws is not None or ws.request.path != f"/{self.token}":
+            log("rejected websocket connection on", ws.request.path[:12])
+            await ws.close(1008, "unauthorised")
+            return
         self.ws = ws
         greeter = None
         try:
@@ -65,6 +76,10 @@ class Session:
                 msg = json.loads(raw)
                 kind = msg.get("type")
                 if kind == "setup":
+                    if self.call_sid and msg.get("callSid") != self.call_sid:
+                        log("rejected session for unknown call", msg.get("callSid"))
+                        await ws.close(1008, "unknown call")
+                        return
                     log("connected", msg.get("callSid"))
                     greeter = asyncio.create_task(self.greet_if_silent())
                 elif kind == "prompt":
@@ -145,8 +160,14 @@ class Session:
                 if tag == END:
                     finish = True
                 elif m := KEYS_RE.fullmatch(tag):
-                    log("keys:", m.group(1))
-                    await self.send({"type": "sendDigits", "digits": m.group(1)})
+                    digits = m.group(1)
+                    # Keys are for phone menus only; cap them so the other side can't talk it into dialling sequences.
+                    if self.keypresses < MAX_KEYPRESSES and len(digits.replace("w", "")) <= MAX_DIGITS:
+                        self.keypresses += 1
+                        log("keys:", digits)
+                        await self.send({"type": "sendDigits", "digits": digits})
+                    else:
+                        log("blocked keys:", digits)
         if hold and not hold.startswith("["):
             await emit(hold)
         await self.send({"type": "text", "token": "", "last": True})
@@ -192,10 +213,10 @@ async def wait_reachable(host: str):
     sys.exit(f"tunnel {host} never became reachable")
 
 
-def twiml(host: str, language: str, provider: str, voice: str) -> str:
+def twiml(host: str, token: str, language: str, provider: str, voice: str) -> str:
     return (
         "<Response><Connect><ConversationRelay "
-        f"url={quoteattr('wss://' + host + '/')} language={quoteattr(language)} "
+        f"url={quoteattr(f'wss://{host}/{token}')} language={quoteattr(language)} "
         f"ttsProvider={quoteattr(provider)} voice={quoteattr(voice)} "
         'transcriptionProvider="Deepgram" dtmfDetection="true" interruptible="any" />'
         "</Connect></Response>"
@@ -231,9 +252,10 @@ async def place_call(args, cfg):
             await wait_reachable(host)
             client = twilio()
             call = client.calls.create(
-                to=args.to, from_=cfg["from"], twiml=twiml(host, language, provider, voice),
+                to=args.to, from_=cfg["from"], twiml=twiml(host, session.token, language, provider, voice),
                 time_limit=int(args.max_minutes * 60),
             )
+            session.call_sid = call.sid
             log("dialling", call.sid)
             status = call.status
             while status not in FINAL:
